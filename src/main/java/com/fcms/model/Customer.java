@@ -3,6 +3,8 @@ package com.fcms.model;
 import jakarta.persistence.*;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.time.temporal.ChronoUnit;
 
 @Entity
 @Table(name = "customers")
@@ -112,6 +114,34 @@ public class Customer {
     public void setStatus(CustomerStatus status) { this.status = status; }
     public LocalDateTime getCreatedAt() { return createdAt; }
     public void setCreatedAt(LocalDateTime createdAt) { this.createdAt = createdAt; }
+
+    /**
+     * How many installment slots the loan has run PAST its planned schedule (e.g. a 100-day
+     * loan that is still unpaid on day 105 returns 5). Only Running loans with a pending
+     * balance extend — the schedule keeps growing one slot per day/week until the loan is
+     * fully collected and closed. 0 when not extended. Computed live (never stored).
+     */
+    public Integer getExtendedInstallments() {
+        if (status != CustomerStatus.Running || startDate == null || totalInstallments == null) return 0;
+        if (pendingAmount == null || pendingAmount <= 0) return 0;
+        LocalDate today = LocalDate.now(ZoneId.of("Asia/Kolkata"));
+        LocalDate lastPlannedSlot = financeType == FinanceType.Weekly
+                ? startDate.plusWeeks(totalInstallments - 1L)
+                : startDate.plusDays(totalInstallments - 1L);
+        if (!today.isAfter(lastPlannedSlot)) return 0;
+        long gap = financeType == FinanceType.Weekly
+                ? ChronoUnit.WEEKS.between(lastPlannedSlot, today)
+                : ChronoUnit.DAYS.between(lastPlannedSlot, today);
+        return (int) Math.max(0, gap);
+    }
+
+    /** Live end date including any automatic extension; null when the loan is not extended. */
+    public LocalDate getExtendedEndDate() {
+        Integer ext = getExtendedInstallments();
+        if (ext == null || ext <= 0 || startDate == null || totalInstallments == null) return null;
+        long total = totalInstallments + (long) ext;
+        return financeType == FinanceType.Weekly ? startDate.plusWeeks(total) : startDate.plusDays(total);
+    }
 
     /**
      * Self-heal older/imported rows that predate the 100-installment default (e.g. rows

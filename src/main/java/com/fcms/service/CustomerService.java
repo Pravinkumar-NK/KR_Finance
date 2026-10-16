@@ -5,12 +5,14 @@ import com.fcms.model.Customer;
 import com.fcms.model.CustomerStatus;
 import com.fcms.model.FinanceType;
 import com.fcms.model.Payment;
+import com.fcms.model.PaymentType;
 import com.fcms.repository.CustomerRepository;
 import com.fcms.repository.PaymentRepository;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDate;
 import java.time.ZoneId;
+import java.time.temporal.ChronoUnit;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
@@ -216,25 +218,41 @@ public class CustomerService {
     }
 
     /**
-     * Quick Collection rows for one date: for today, every Running loan that's due/overdue OR
-     * already has a payment recorded today; for any other (past) date, every loan that has a
-     * payment recorded on that date — so the same date-driven view works for live same-day
-     * collection and for looking back at/editing an earlier day's collections.
+     * Quick Collection rows for one date.
+     *
+     * - Today: every Running loan that is due/overdue OR already has a payment recorded today.
+     * - Any PAST date: every loan that has a payment on that date PLUS every loan that was
+     *   scheduled to be collected that day but was never marked (paymentId == null), so missed
+     *   entries can be filled in later with Paid / Partial / Not Paid / Advance exactly like today.
+     *   A loan is "scheduled" on a past date when the date is on/after its start date, falls on
+     *   its weekly collection slot (Weekly loans), the loan was still active that day, and the
+     *   day was not already covered by an earlier Advance payment. Because a Running loan keeps
+     *   a slot for every day until it is fully collected, days beyond the planned 100 (or N)
+     *   installments appear automatically as "extended" days.
+     * - Future dates: only loans with a payment recorded on that date.
      */
     public List<QuickCollectionRow> getQuickCollection(LocalDate date) {
         LocalDate today = LocalDate.now(IST);
         Map<Long, Payment> paymentsOnDate = paymentRepository.findByDate(date).stream()
                 .collect(Collectors.toMap(Payment::getCustomerId, p -> p, (a, b) -> a));
 
+        List<Customer> all = customerRepository.findAll();
         List<Customer> rows;
         if (date.equals(today)) {
-            rows = customerRepository.findAll().stream()
+            rows = all.stream()
                     .filter(c -> c.getStatus() == CustomerStatus.Running)
                     .filter(c -> paymentsOnDate.containsKey(c.getId())
                             || (c.getNextDueDate() != null && !c.getNextDueDate().isAfter(today)))
                     .toList();
+        } else if (date.isBefore(today)) {
+            Map<Long, Set<LocalDate>> covered = advanceCoveredDates(all);
+            rows = all.stream()
+                    .filter(c -> paymentsOnDate.containsKey(c.getId())
+                            || (isScheduledOn(c, date)
+                                && !covered.getOrDefault(c.getId(), Set.of()).contains(date)))
+                    .toList();
         } else {
-            rows = customerRepository.findAll().stream()
+            rows = all.stream()
                     .filter(c -> paymentsOnDate.containsKey(c.getId()))
                     .toList();
         }
@@ -252,6 +270,12 @@ public class CustomerService {
                     row.setFinanceType(c.getFinanceType());
                     row.setNextDueDate(c.getNextDueDate());
                     row.setStatus(c.getStatus());
+                    row.setTotalInstallments(c.getTotalInstallments());
+                    int slot = slotNumber(c, date);
+                    if (slot > 0) {
+                        row.setInstallmentNo(slot);
+                        row.setExtended(c.getTotalInstallments() != null && slot > c.getTotalInstallments());
+                    }
                     Payment p = paymentsOnDate.get(c.getId());
                     if (p != null) {
                         row.setPaymentId(p.getId());
@@ -263,6 +287,49 @@ public class CustomerService {
                     return row;
                 })
                 .toList();
+    }
+
+    /** 1-based installment slot a date represents for a loan (0 if before start or off a weekly slot). */
+    public int slotNumber(Customer c, LocalDate date) {
+        if (c.getStartDate() == null || date.isBefore(c.getStartDate())) return 0;
+        long days = ChronoUnit.DAYS.between(c.getStartDate(), date);
+        if (c.getFinanceType() == FinanceType.Weekly) {
+            return days % 7 == 0 ? (int) (days / 7) + 1 : 0;
+        }
+        return (int) days + 1;
+    }
+
+    /**
+     * Was this loan expected to be collected on a (past) date? Running loans keep a slot every
+     * day/week, so the schedule extends past totalInstallments until the loan is paid off.
+     * Completed / Closed loans only count up to their last recorded payment date.
+     */
+    private boolean isScheduledOn(Customer c, LocalDate date) {
+        if (slotNumber(c, date) == 0) return false;
+        if (c.getStatus() == CustomerStatus.Running) return true;
+        return c.getLastPaymentDate() != null && !date.isAfter(c.getLastPaymentDate());
+    }
+
+    /**
+     * Dates already paid for by an Advance payment that covered more than one installment
+     * (the advance's own date is not included — it has its own payment row). These days must
+     * not show up as "unmarked" on Quick Collection.
+     */
+    private Map<Long, Set<LocalDate>> advanceCoveredDates(List<Customer> customers) {
+        Map<Long, Customer> byId = customers.stream().collect(Collectors.toMap(Customer::getId, c -> c, (a, b) -> a));
+        Map<Long, Set<LocalDate>> out = new java.util.HashMap<>();
+        for (Payment p : paymentRepository.findByType(PaymentType.Advance)) {
+            Customer c = byId.get(p.getCustomerId());
+            if (c == null || p.getDate() == null || p.getAmount() == null) continue;
+            double inst = c.getInstallmentAmount() == null ? 0 : c.getInstallmentAmount();
+            if (inst <= 0) continue;
+            int periods = Math.max(1, (int) Math.floor(p.getAmount() / inst));
+            for (int i = 1; i < periods; i++) {
+                LocalDate d = c.getFinanceType() == FinanceType.Weekly ? p.getDate().plusWeeks(i) : p.getDate().plusDays(i);
+                out.computeIfAbsent(c.getId(), k -> new java.util.HashSet<>()).add(d);
+            }
+        }
+        return out;
     }
 
     /**

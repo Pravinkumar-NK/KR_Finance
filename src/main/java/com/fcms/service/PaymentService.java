@@ -63,17 +63,51 @@ public class PaymentService {
         }
 
         LocalDate today = LocalDate.now(ZoneId.of("Asia/Kolkata"));
+        boolean weekly = customer.getFinanceType() == FinanceType.Weekly;
 
         // Group recorded payments by date so multiple payments on the same day (e.g. a
-        // Partial
-        // followed later by a top-up) are both surfaced against that installment slot.
+        // Partial followed later by a top-up) are both surfaced against that installment slot.
         List<Payment> payments = paymentRepository.findByCustomerIdOrderByDateDesc(customerId);
         Map<LocalDate, List<Payment>> byDate = payments.stream()
                 .filter(p -> p.getDate() != null)
                 .collect(Collectors.groupingBy(Payment::getDate));
 
-        for (int i = 0; i < customer.getTotalInstallments(); i++) {
-            LocalDate slotDate = customer.getFinanceType() == FinanceType.Weekly
+        // Days already paid for by a multi-installment Advance (e.g. Rs. 3,000 advance on a
+        // Rs. 1,000/day loan covers that day and the next two) — shown as "Covered".
+        double inst = customer.getInstallmentAmount() == null ? 0 : customer.getInstallmentAmount();
+        java.util.Set<LocalDate> covered = new java.util.HashSet<>();
+        if (inst > 0) {
+            for (Payment p : payments) {
+                if (p.getType() == PaymentType.Advance && p.getDate() != null && p.getAmount() != null) {
+                    int periods = Math.max(1, (int) Math.floor(p.getAmount() / inst));
+                    for (int k = 1; k < periods; k++) {
+                        covered.add(weekly ? p.getDate().plusWeeks(k) : p.getDate().plusDays(k));
+                    }
+                }
+            }
+        }
+
+        // The planned schedule is totalInstallments slots. A Running loan that still has a
+        // balance keeps adding one slot per day/week (up to today) until it is fully collected,
+        // so e.g. a 100-day loan unpaid on day 105 shows Day 101..105 as well.
+        int slots = customer.getTotalInstallments();
+        boolean running = customer.getStatus() == CustomerStatus.Running
+                && (customer.getPendingAmount() == null || customer.getPendingAmount() > 0);
+        if (running) {
+            long elapsed = weekly
+                    ? java.time.temporal.ChronoUnit.WEEKS.between(customer.getStartDate(), today)
+                    : java.time.temporal.ChronoUnit.DAYS.between(customer.getStartDate(), today);
+            slots = (int) Math.max(slots, elapsed + 1);
+        } else if (customer.getLastPaymentDate() != null) {
+            // Finished late: keep every day up to the final payment visible too.
+            long toLast = weekly
+                    ? java.time.temporal.ChronoUnit.WEEKS.between(customer.getStartDate(), customer.getLastPaymentDate())
+                    : java.time.temporal.ChronoUnit.DAYS.between(customer.getStartDate(), customer.getLastPaymentDate());
+            slots = (int) Math.max(slots, toLast + 1);
+        }
+
+        for (int i = 0; i < slots; i++) {
+            LocalDate slotDate = weekly
                     ? customer.getStartDate().plusWeeks(i)
                     : customer.getStartDate().plusDays(i);
 
@@ -86,6 +120,8 @@ public class PaymentService {
                         .orElse(onDate.get(0));
                 entries.add(new TimelineEntry(i + 1, slotDate, latest.getType().name(), latest.getAmount(),
                         latest.getId(), isToday));
+            } else if (covered.contains(slotDate)) {
+                entries.add(new TimelineEntry(i + 1, slotDate, "Covered", null, null, isToday));
             } else if (slotDate.isAfter(today)) {
                 entries.add(new TimelineEntry(i + 1, slotDate, "Pending", null, null, false));
             } else if (isToday) {
@@ -114,6 +150,9 @@ public class PaymentService {
         Customer customer = customerRepository.findById(payment.getCustomerId())
                 .orElseThrow(() -> new IllegalArgumentException("Customer not found"));
 
+        LocalDate priorNextDue = customer.getNextDueDate();
+        LocalDate todayIst = LocalDate.now(ZoneId.of("Asia/Kolkata"));
+
         List<Payment> existingForDate = payment.getDate() == null
                 ? List.of()
                 : paymentRepository.findByCustomerIdAndDate(payment.getCustomerId(), payment.getDate());
@@ -127,6 +166,15 @@ public class PaymentService {
         payment.setCreatedAt(LocalDateTime.now());
         applyEffect(customer, payment);
         customer.setLastPaymentType(payment.getType().name());
+
+        // Filling in an OLD day (back-dated entry from Quick Collection) must never pull the
+        // loan's next due date backwards — e.g. marking yesterday after today was already paid
+        // would otherwise make today show as due again.
+        if (payment.getDate() != null && payment.getDate().isBefore(todayIst)
+                && priorNextDue != null
+                && (customer.getNextDueDate() == null || customer.getNextDueDate().isBefore(priorNextDue))) {
+            customer.setNextDueDate(priorNextDue);
+        }
 
         customerService.recomputeDerived(customer);
         customerRepository.save(customer);

@@ -29,6 +29,12 @@ public class QuickCollectionRow {
     private String notes;
     private String collectedBy;
 
+    /** Installment slot number this row's date represents for the loan (may exceed totalInstallments when the loan was auto-extended). */
+    private Integer installmentNo;
+    private Integer totalInstallments;
+    /** True when installmentNo is beyond the planned schedule, i.e. an automatically extended day. */
+    private boolean extended;
+
     public Long getCustomerId() { return customerId; }
     public void setCustomerId(Long customerId) { this.customerId = customerId; }
     public String getName() { return name; }
@@ -57,4 +63,10 @@ public class QuickCollectionRow {
     public void setNotes(String notes) { this.notes = notes; }
     public String getCollectedBy() { return collectedBy; }
     public void setCollectedBy(String collectedBy) { this.collectedBy = collectedBy; }
+    public Integer getInstallmentNo() { return installmentNo; }
+    public void setInstallmentNo(Integer installmentNo) { this.installmentNo = installmentNo; }
+    public Integer getTotalInstallments() { return totalInstallments; }
+    public void setTotalInstallments(Integer totalInstallments) { this.totalInstallments = totalInstallments; }
+    public boolean isExtended() { return extended; }
+    public void setExtended(boolean extended) { this.extended = extended; }
 }

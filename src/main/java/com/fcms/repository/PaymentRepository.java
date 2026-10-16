@@ -1,6 +1,7 @@
 package com.fcms.repository;
 
 import com.fcms.model.Payment;
+import com.fcms.model.PaymentType;
 import org.springframework.data.jpa.repository.JpaRepository;
 
 import java.time.LocalDate;
@@ -12,4 +13,5 @@ public interface PaymentRepository extends JpaRepository<Payment, Long> {
     List<Payment> findByDateBetween(LocalDate start, LocalDate end);
     /** Normally at most one, but returns a List so any pre-existing duplicate-day data self-heals instead of erroring. */
     List<Payment> findByCustomerIdAndDate(Long customerId, LocalDate date);
+    List<Payment> findByType(PaymentType type);
 }
